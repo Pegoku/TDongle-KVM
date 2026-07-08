@@ -60,9 +60,11 @@ button{border:1px solid #b7c4d6;background:#f8fafc;border-radius:7px;padding:10p
 button:active{transform:translateY(1px);background:#e2e8f0}
 .danger{background:#fff1f2;border-color:#fda4af}
 .primary{background:#dbeafe;border-color:#93c5fd}
+.active{background:#dcfce7;border-color:#86efac}
 #capture{min-height:132px;border:2px dashed #94a3b8;border-radius:8px;display:grid;place-items:center;text-align:center;padding:18px;outline:none;background:#f8fafc;touch-action:none}
-#capture:focus{border-color:#2563eb;background:#eff6ff}
+#capture:focus,#capture.active{border-color:#2563eb;background:#eff6ff}
 #pad{height:320px;border:1px solid #94a3b8;border-radius:8px;background:#111827;color:#e5e7eb;display:grid;place-items:center;text-align:center;touch-action:none;user-select:none}
+#pad.locked{border-color:#22c55e;background:#052e16}
 #screen{width:100%;min-height:180px;background:#0f172a;border:1px solid #334155;border-radius:8px;display:grid;place-items:center;overflow:hidden}
 #screen img{width:100%;height:auto;display:none}
 #screen .empty{color:#cbd5e1;text-align:center;padding:24px;font-size:14px}
@@ -74,15 +76,16 @@ textarea{width:100%;min-height:80px;box-sizing:border-box;border:1px solid #cbd5
 <body>
 <header>
   <h1>T-Dongle Remote HID</h1>
-  <div class="status" id="status">Ready. Click keyboard capture before typing.</div>
+  <div class="status" id="status">Ready. Press Start Control to capture keyboard and mouse.</div>
 </header>
 <main>
   <section class="panel">
     <div id="capture" tabindex="0">
-      <div><strong>Keyboard capture</strong><br>Click here, then type. Use the release button if a key gets stuck.</div>
+      <div><strong>Control capture</strong><br>Press Start Control to focus keyboard and mouse together. Press Shift+Esc to quit.</div>
     </div>
     <p class="row">
-      <button class="danger" onclick="releaseAll()">Release all keys</button>
+      <button class="primary" id="enterControl">Start Control</button>
+      <button class="danger" onclick="exitControl()">Stop / Release</button>
       <button onclick="combo('ctrl_alt_del')">Ctrl+Alt+Del</button>
       <button onclick="combo('win_l')">Win+L</button>
       <button onclick="combo('alt_tab')">Alt+Tab</button>
@@ -100,7 +103,7 @@ textarea{width:100%;min-height:80px;box-sizing:border-box;border:1px solid #cbd5
   <section class="grid">
     <div class="panel">
       <h2 style="font-size:16px;margin:0 0 10px">Mouse</h2>
-      <div id="pad">Drag here to move mouse<br>Tap/click for left click<br>Two-finger scroll may work on touchpads</div>
+      <div id="pad">Start Control locks mouse movement here<br>Shift+Esc exits control mode<br>Drag still works as fallback</div>
       <p class="row">
         <button onclick="mouseButton('left','click')">Left Click</button>
         <button onclick="mouseButton('right','click')">Right Click</button>
@@ -122,10 +125,12 @@ textarea{width:100%;min-height:80px;box-sizing:border-box;border:1px solid #cbd5
 const statusEl = document.getElementById('status');
 const capture = document.getElementById('capture');
 const pad = document.getElementById('pad');
+const enterControl = document.getElementById('enterControl');
 const screenImg = document.getElementById('screenImg');
 const screenEmpty = document.getElementById('screenEmpty');
 const screenStatus = document.getElementById('screenStatus');
 const pressed = new Set();
+let controlActive = false;
 let pointerId = null;
 let lastX = 0;
 let lastY = 0;
@@ -152,7 +157,49 @@ function keyPayload(ev, action) {
   return {action, code: ev.code || '', key: ev.key || ''};
 }
 
-capture.addEventListener('keydown', ev => {
+function updateControlUi() {
+  capture.classList.toggle('active', controlActive);
+  pad.classList.toggle('locked', document.pointerLockElement === pad);
+  enterControl.classList.toggle('active', controlActive);
+  enterControl.textContent = controlActive ? 'Control Active' : 'Start Control';
+}
+
+function enterControlMode() {
+  controlActive = true;
+  capture.focus({preventScroll:true});
+  if (pad.requestPointerLock) {
+    pad.requestPointerLock();
+  }
+  updateControlUi();
+  setStatus('Control active. Keyboard and mouse are captured. Press Shift+Esc to quit.');
+}
+
+function exitControl() {
+  controlActive = false;
+  if (document.pointerLockElement) {
+    document.exitPointerLock();
+  }
+  releaseAll('Control stopped. Released all keys and mouse buttons.');
+  updateControlUi();
+}
+
+enterControl.addEventListener('click', enterControlMode);
+
+document.addEventListener('pointerlockchange', () => {
+  if (document.pointerLockElement !== pad && controlActive) {
+    controlActive = false;
+    releaseAll('Mouse capture exited. Released all keys and mouse buttons.');
+  }
+  updateControlUi();
+});
+
+document.addEventListener('keydown', ev => {
+  if (controlActive && ev.key === 'Escape' && ev.shiftKey) {
+    ev.preventDefault();
+    exitControl();
+    return;
+  }
+  if (!controlActive) return;
   if (ev.repeat || pressed.has(ev.code)) {
     ev.preventDefault();
     return;
@@ -161,21 +208,26 @@ capture.addEventListener('keydown', ev => {
   post('/api/key', keyPayload(ev, 'down'));
   setStatus('Key down: ' + (ev.key || ev.code));
   ev.preventDefault();
-});
+}, true);
 
-capture.addEventListener('keyup', ev => {
+document.addEventListener('keyup', ev => {
+  if (!controlActive) return;
   pressed.delete(ev.code);
   post('/api/key', keyPayload(ev, 'up'));
   setStatus('Key up: ' + (ev.key || ev.code));
   ev.preventDefault();
+}, true);
+
+window.addEventListener('blur', () => {
+  controlActive = false;
+  releaseAll('Window lost focus. Released all keys and mouse buttons.');
+  updateControlUi();
 });
 
-window.addEventListener('blur', releaseAll);
-
-function releaseAll() {
+function releaseAll(message = 'Released all keys and mouse buttons') {
   pressed.clear();
   post('/api/release');
-  setStatus('Released all keys and mouse buttons');
+  setStatus(message);
 }
 
 function combo(name) {
@@ -211,7 +263,39 @@ function mouseButton(button, action) {
   post('/api/mouseButton', {button, action});
 }
 
+function browserButtonName(button) {
+  if (button === 2) return 'right';
+  if (button === 1) return 'middle';
+  return 'left';
+}
+
+document.addEventListener('mousemove', ev => {
+  if (!controlActive || document.pointerLockElement !== pad) return;
+  pendingDx += ev.movementX * 1.3;
+  pendingDy += ev.movementY * 1.3;
+  scheduleMouse();
+  ev.preventDefault();
+}, true);
+
+document.addEventListener('mousedown', ev => {
+  if (!controlActive || document.pointerLockElement !== pad) return;
+  mouseButton(browserButtonName(ev.button), 'down');
+  ev.preventDefault();
+}, true);
+
+document.addEventListener('mouseup', ev => {
+  if (!controlActive || document.pointerLockElement !== pad) return;
+  mouseButton(browserButtonName(ev.button), 'up');
+  ev.preventDefault();
+}, true);
+
+document.addEventListener('contextmenu', ev => {
+  if (!controlActive) return;
+  ev.preventDefault();
+}, true);
+
 pad.addEventListener('pointerdown', ev => {
+  if (document.pointerLockElement === pad) return;
   pointerId = ev.pointerId;
   lastX = ev.clientX;
   lastY = ev.clientY;
@@ -222,6 +306,7 @@ pad.addEventListener('pointerdown', ev => {
 });
 
 pad.addEventListener('pointermove', ev => {
+  if (document.pointerLockElement === pad) return;
   if (ev.pointerId !== pointerId) return;
   pendingDx += (ev.clientX - lastX) * 1.3;
   pendingDy += (ev.clientY - lastY) * 1.3;
@@ -232,6 +317,7 @@ pad.addEventListener('pointermove', ev => {
 });
 
 pad.addEventListener('pointerup', ev => {
+  if (document.pointerLockElement === pad) return;
   if (ev.pointerId !== pointerId) return;
   pad.releasePointerCapture(pointerId);
   pointerId = null;
@@ -240,9 +326,16 @@ pad.addEventListener('pointerup', ev => {
 });
 
 pad.addEventListener('wheel', ev => {
+  if (document.pointerLockElement === pad) return;
   mouseMove(0, 0, ev.deltaY > 0 ? 3 : -3);
   ev.preventDefault();
 }, {passive:false});
+
+document.addEventListener('wheel', ev => {
+  if (!controlActive || document.pointerLockElement !== pad) return;
+  mouseMove(0, 0, ev.deltaY > 0 ? 3 : -3);
+  ev.preventDefault();
+}, {passive:false, capture:true});
 
 async function refreshScreen() {
   try {

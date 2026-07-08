@@ -31,7 +31,8 @@ The project uses the generic `esp32-s3-devkitc-1` PlatformIO board because the T
    - SSID: `TDongle-KVM`
    - Password: `tdongle123`
 4. Open `http://192.168.4.1/`. Most devices should also be redirected by the captive portal.
-5. Click the keyboard capture area before typing.
+5. Press `Start Control` in the web UI to capture keyboard and mouse together.
+6. Press `Shift+Esc` to quit control mode and release all keys/buttons.
 
 ## Screen Preview
 
@@ -67,7 +68,8 @@ For true no-software video, this project would need additional hardware such as 
 ## Notes
 
 - Keyboard mapping is best with a US keyboard layout on the host computer.
-- The browser must keep the page focused to send key release events correctly. The firmware also releases all keys when requested from the UI.
+- Control mode uses browser pointer lock when available. Browsers may also exit pointer lock with `Esc`; `Shift+Esc` is the intended release shortcut because it also tells the dongle to release all HID inputs.
+- The browser must keep the page focused to send key release events correctly. The firmware also releases all keys when requested from the UI or when control mode exits.
 - This is intentionally local-only. Anyone with the AP password can control the attached computer, so change the credentials in `src/main.cpp` before using it around other people.
 
 ## Repository Description
