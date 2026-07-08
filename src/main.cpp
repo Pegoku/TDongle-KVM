@@ -10,6 +10,9 @@ namespace {
 constexpr char kApSsid[] = "TDongle-KVM";
 constexpr char kApPassword[] = "tdongle123";
 constexpr byte kDnsPort = 53;
+constexpr uint32_t kMaxScreenshotBytes = 180UL * 1024UL;
+constexpr char kScreenshotMagic[] = "TDKVIMG1";
+constexpr uint8_t kScreenshotMagicLen = 8;
 
 IPAddress apIp(192, 168, 4, 1);
 IPAddress netmask(255, 255, 255, 0);
@@ -18,6 +21,23 @@ DNSServer dnsServer;
 WebServer server(80);
 USBHIDKeyboard keyboard;
 USBHIDMouse mouse;
+
+uint8_t *screenshotBuffer = nullptr;
+uint32_t screenshotLength = 0;
+uint32_t screenshotSequence = 0;
+uint32_t lastScreenshotMillis = 0;
+
+enum class ScreenshotRxState : uint8_t {
+  Magic,
+  Length,
+  Payload,
+};
+
+ScreenshotRxState screenshotRxState = ScreenshotRxState::Magic;
+uint8_t screenshotMagicIndex = 0;
+uint8_t screenshotLengthIndex = 0;
+uint32_t screenshotExpectedLength = 0;
+uint32_t screenshotReceivedLength = 0;
 
 const char kIndexHtml[] PROGMEM = R"rawliteral(
 <!doctype html>
@@ -43,6 +63,9 @@ button:active{transform:translateY(1px);background:#e2e8f0}
 #capture{min-height:132px;border:2px dashed #94a3b8;border-radius:8px;display:grid;place-items:center;text-align:center;padding:18px;outline:none;background:#f8fafc;touch-action:none}
 #capture:focus{border-color:#2563eb;background:#eff6ff}
 #pad{height:320px;border:1px solid #94a3b8;border-radius:8px;background:#111827;color:#e5e7eb;display:grid;place-items:center;text-align:center;touch-action:none;user-select:none}
+#screen{width:100%;min-height:180px;background:#0f172a;border:1px solid #334155;border-radius:8px;display:grid;place-items:center;overflow:hidden}
+#screen img{width:100%;height:auto;display:none}
+#screen .empty{color:#cbd5e1;text-align:center;padding:24px;font-size:14px}
 textarea{width:100%;min-height:80px;box-sizing:border-box;border:1px solid #cbd5e1;border-radius:7px;padding:10px;resize:vertical}
 .grid{display:grid;grid-template-columns:1fr;gap:14px}
 @media (min-width:760px){.grid{grid-template-columns:1fr 1fr}}
@@ -65,6 +88,14 @@ textarea{width:100%;min-height:80px;box-sizing:border-box;border:1px solid #cbd5
       <button onclick="combo('alt_tab')">Alt+Tab</button>
       <button onclick="combo('ctrl_shift_esc')">Ctrl+Shift+Esc</button>
     </p>
+  </section>
+  <section class="panel">
+    <h2 style="font-size:16px;margin:0 0 10px">Screen Preview</h2>
+    <div id="screen">
+      <img id="screenImg" alt="Latest screenshot from host">
+      <div class="empty" id="screenEmpty">No screenshot received. Run the host screenshot sender on the controlled computer.</div>
+    </div>
+    <p class="status" id="screenStatus">Waiting for frames over USB serial.</p>
   </section>
   <section class="grid">
     <div class="panel">
@@ -91,6 +122,9 @@ textarea{width:100%;min-height:80px;box-sizing:border-box;border:1px solid #cbd5
 const statusEl = document.getElementById('status');
 const capture = document.getElementById('capture');
 const pad = document.getElementById('pad');
+const screenImg = document.getElementById('screenImg');
+const screenEmpty = document.getElementById('screenEmpty');
+const screenStatus = document.getElementById('screenStatus');
 const pressed = new Set();
 let pointerId = null;
 let lastX = 0;
@@ -100,6 +134,7 @@ let startY = 0;
 let pendingDx = 0;
 let pendingDy = 0;
 let mouseTimer = 0;
+let lastScreenSeq = 0;
 
 function setStatus(text){ statusEl.textContent = text; }
 
@@ -208,10 +243,95 @@ pad.addEventListener('wheel', ev => {
   mouseMove(0, 0, ev.deltaY > 0 ? 3 : -3);
   ev.preventDefault();
 }, {passive:false});
+
+async function refreshScreen() {
+  try {
+    const res = await fetch('/api/screenshotStatus', {cache:'no-store'});
+    if (!res.ok) throw new Error(res.status);
+    const data = await res.json();
+    if (!data.available) {
+      screenStatus.textContent = 'Waiting for frames over USB serial.';
+      return;
+    }
+    screenStatus.textContent = 'Latest frame: ' + data.bytes + ' bytes, ' + data.age_ms + ' ms old';
+    if (data.seq !== lastScreenSeq) {
+      lastScreenSeq = data.seq;
+      screenImg.onload = () => {
+        screenImg.style.display = 'block';
+        screenEmpty.style.display = 'none';
+      };
+      screenImg.src = '/screenshot.jpg?seq=' + data.seq;
+    }
+  } catch (err) {
+    screenStatus.textContent = 'Screen status failed: ' + err.message;
+  }
+}
+
+setInterval(refreshScreen, 1000);
+refreshScreen();
 </script>
 </body>
 </html>
 )rawliteral";
+
+void resetScreenshotRx() {
+  screenshotRxState = ScreenshotRxState::Magic;
+  screenshotMagicIndex = 0;
+  screenshotLengthIndex = 0;
+  screenshotExpectedLength = 0;
+  screenshotReceivedLength = 0;
+}
+
+void readScreenshotSerial() {
+  if (!screenshotBuffer) {
+    return;
+  }
+
+  uint16_t processed = 0;
+  while (Serial.available() && processed < 4096) {
+    const uint8_t b = static_cast<uint8_t>(Serial.read());
+    ++processed;
+
+    switch (screenshotRxState) {
+      case ScreenshotRxState::Magic:
+        if (b == static_cast<uint8_t>(kScreenshotMagic[screenshotMagicIndex])) {
+          ++screenshotMagicIndex;
+          if (screenshotMagicIndex == kScreenshotMagicLen) {
+            screenshotRxState = ScreenshotRxState::Length;
+            screenshotLengthIndex = 0;
+            screenshotExpectedLength = 0;
+          }
+        } else {
+          screenshotMagicIndex = (b == static_cast<uint8_t>(kScreenshotMagic[0])) ? 1 : 0;
+        }
+        break;
+
+      case ScreenshotRxState::Length:
+        screenshotExpectedLength |= static_cast<uint32_t>(b) << (8 * screenshotLengthIndex);
+        ++screenshotLengthIndex;
+        if (screenshotLengthIndex == 4) {
+          if (screenshotExpectedLength == 0 || screenshotExpectedLength > kMaxScreenshotBytes) {
+            resetScreenshotRx();
+          } else {
+            screenshotLength = 0;
+            screenshotReceivedLength = 0;
+            screenshotRxState = ScreenshotRxState::Payload;
+          }
+        }
+        break;
+
+      case ScreenshotRxState::Payload:
+        screenshotBuffer[screenshotReceivedLength++] = b;
+        if (screenshotReceivedLength == screenshotExpectedLength) {
+          screenshotLength = screenshotExpectedLength;
+          ++screenshotSequence;
+          lastScreenshotMillis = millis();
+          resetScreenshotRx();
+        }
+        break;
+    }
+  }
+}
 
 uint8_t mouseButtonMask(const String &button) {
   if (button == "right") {
@@ -281,6 +401,35 @@ void sendOk(const char *message = "ok") {
 void handleRoot() {
   sendNoCache();
   server.send_P(200, "text/html", kIndexHtml);
+}
+
+void handleScreenshot() {
+  sendNoCache();
+  if (!screenshotBuffer || screenshotLength == 0) {
+    server.send(404, "text/plain", "no screenshot");
+    return;
+  }
+
+  server.setContentLength(screenshotLength);
+  server.send(200, "image/jpeg", "");
+  server.client().write(screenshotBuffer, screenshotLength);
+}
+
+void handleScreenshotStatus() {
+  sendNoCache();
+  const bool available = screenshotBuffer && screenshotLength > 0;
+  const uint32_t ageMs = available ? millis() - lastScreenshotMillis : 0;
+  String json = "{";
+  json += "\"available\":";
+  json += available ? "true" : "false";
+  json += ",\"seq\":";
+  json += screenshotSequence;
+  json += ",\"bytes\":";
+  json += screenshotLength;
+  json += ",\"age_ms\":";
+  json += ageMs;
+  json += "}";
+  server.send(200, "application/json", json);
 }
 
 void handleNotFound() {
@@ -389,6 +538,8 @@ void setupServer() {
   server.on("/hotspot-detect.html", HTTP_GET, handleRoot);
   server.on("/ncsi.txt", HTTP_GET, handleRoot);
   server.on("/connecttest.txt", HTTP_GET, handleRoot);
+  server.on("/screenshot.jpg", HTTP_GET, handleScreenshot);
+  server.on("/api/screenshotStatus", HTTP_GET, handleScreenshotStatus);
   server.on("/api/key", HTTP_POST, handleKey);
   server.on("/api/text", HTTP_POST, handleText);
   server.on("/api/mouse", HTTP_POST, handleMouse);
@@ -403,6 +554,7 @@ void setupServer() {
 void setup() {
   Serial.begin(115200);
   delay(300);
+  screenshotBuffer = static_cast<uint8_t *>(malloc(kMaxScreenshotBytes));
 
   keyboard.begin();
   mouse.begin();
@@ -421,9 +573,12 @@ void setup() {
   Serial.println(kApSsid);
   Serial.print("URL: http://");
   Serial.println(apIp);
+  Serial.print("Screenshot buffer: ");
+  Serial.println(screenshotBuffer ? "ready" : "allocation failed");
 }
 
 void loop() {
+  readScreenshotSerial();
   dnsServer.processNextRequest();
   server.handleClient();
 }

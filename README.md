@@ -8,6 +8,7 @@ Firmware for a LilyGo T-Dongle S3 that creates a Wi-Fi access point and browser 
 - Browser UI served directly from the dongle.
 - USB HID keyboard events, text typing, and common shortcuts.
 - USB HID mouse movement, clicks, and wheel scrolling.
+- Optional screenshot preview in the browser UI when a host-side screenshot sender is running.
 - PlatformIO/Arduino C++ firmware for ESP32-S3.
 
 ## Build and Flash
@@ -31,6 +32,37 @@ The project uses the generic `esp32-s3-devkitc-1` PlatformIO board because the T
    - Password: `tdongle123`
 4. Open `http://192.168.4.1/`. Most devices should also be redirected by the captive portal.
 5. Click the keyboard capture area before typing.
+
+## Screen Preview
+
+The T-Dongle S3 cannot read the target computer's display through USB HID. Screenshot preview therefore needs a small program running on the computer being controlled. The script captures the desktop once per second, compresses it to JPEG, and sends it to the dongle over USB serial. The dongle then serves the latest frame in the web UI.
+
+Install the Python dependencies on the controlled computer:
+
+```sh
+python -m pip install -r scripts/requirements.txt
+```
+
+Run the sender:
+
+```sh
+python scripts/screenshot_sender.py
+```
+
+If auto-detection does not pick the dongle serial port, pass it explicitly:
+
+```sh
+python scripts/screenshot_sender.py --port /dev/ttyACM0
+python scripts/screenshot_sender.py --port COM5
+```
+
+Useful options:
+
+```sh
+python scripts/screenshot_sender.py --interval 1 --max-width 960 --quality 45
+```
+
+For true no-software video, this project would need additional hardware such as an HDMI capture path. The T-Dongle S3 alone is suitable for USB HID control and low-rate preview frames, not full KVM video capture.
 
 ## Notes
 
